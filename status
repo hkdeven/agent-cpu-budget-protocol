@@ -1,0 +1,22 @@
+#!/usr/bin/env node
+'use strict';
+// Prints the vitest runs registered now and the share a new run would get. Read-only: prunes nothing.
+const path = require('path');
+const ts = require(path.join(__dirname, 'preload.cjs'));
+
+const dir = ts.registryDir();
+const cores = ts.coreCount();
+const min = ts.intEnv('TEST_SHARE_MIN', 2, 1, cores);
+const runs = ts.readRuns(dir, false).sort((a, b) => (a.started || 0) - (b.started || 0));
+const on = /test-share[\\/]preload\.cjs/.test(process.env.NODE_OPTIONS || '') && process.env.TEST_SHARE !== '0';
+
+console.log(`test-share: ${on ? 'on' : 'off'} in this shell, ${cores} cores, min ${min}, registry ${dir}`);
+if (!runs.length) console.log('no active runs');
+for (const r of runs) {
+  const age = r.started ? Math.round((Date.now() - r.started) / 1000) + 's' : '?';
+  const workers = r.share == null ? 'default' : String(r.share);
+  console.log(`  pid ${String(r.pid).padEnd(6)} ${(r.watch ? 'watch' : 'run').padEnd(5)} workers ${workers.padEnd(7)} age ${age.padEnd(6)} ${r.cwd || ''}`);
+}
+const active = ts.countActive(runs, -1) + 1;
+const share = ts.shareFor(active, cores, min);
+console.log(`a run started now would be 1 of ${active} and get ${share === null ? `vitest's default (${Math.max(cores - 1, 1)} workers)` : share + ' workers'}`);
