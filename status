@@ -14,12 +14,16 @@ const claimed = sharing.reduce((sum, r) => sum + (typeof r.share === 'number' ? 
 const on = /test-share[\\/]preload\.cjs/.test(process.env.NODE_OPTIONS || '') && process.env.TEST_SHARE !== '0';
 
 console.log(`test-share: ${on ? 'on' : 'off'} in this shell, ${cores} cores, min ${min}, registry ${dir}`);
-console.log(`budget ${budget} workers, claimed ${claimed}, free ${Math.max(0, budget - claimed)}${claimed > budget ? `, over by ${claimed - budget}` : ''}`);
+console.log(`budget ${budget} workers, claimed ${claimed}, free ${Math.max(0, budget - claimed)}, waiting ${sharing.filter((r) => r.waiting).length}${claimed > budget ? `, over by ${claimed - budget}` : ''}`);
 if (!runs.length) console.log('no active runs');
+const queue = sharing.filter((r) => r.waiting).sort((a, b) => (a.seq || 0) - (b.seq || 0) || a.pid - b.pid);
 for (const r of runs) {
   const age = r.started ? Math.round((Date.now() - r.started) / 1000) + 's' : '?';
-  const share = r.watch ? 'not counted' : typeof r.share === 'number' ? String(r.share) : 'deciding';
+  const share = r.watch ? 'not counted' : r.waiting ? `waiting #${queue.indexOf(r) + 1}` : typeof r.share === 'number' ? String(r.share) : 'deciding';
   console.log(`  pid ${String(r.pid).padEnd(6)} ${(r.watch ? 'watch' : 'run').padEnd(5)} share ${share.padEnd(11)} age ${age.padEnd(6)} ${r.cwd || ''}`);
 }
 const next = ts.claimFor(sharing, Infinity, 0, budget, min);
-console.log(`a run started now would be 1 of ${next.active} and get ${next.share} workers`);
+const wait = ts.intEnv('TEST_SHARE_WAIT', 60, 0, 86400);
+if (wait > 0 && (next.ahead > 0 || next.free < min)) {
+  console.log(`a run started now would wait (up to ${wait}s) behind ${next.ahead} waiting, for ${min} free workers`);
+} else console.log(`a run started now would be 1 of ${next.active} and get ${next.share} workers`);

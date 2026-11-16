@@ -5,7 +5,8 @@
  *
  * Non-targets leave through the few lines at the bottom of this file: no requires, no I/O.
  * Targets:
- *   - a vitest main process: registered in the registry, given workers out of a machine-wide budget, and niced
+ *   - a vitest main process: registered in the registry, given workers out of a machine-wide budget
+ *     (waiting for a share when the budget is used up), and niced
  *   - tsc / vue-tsc: niced
  * Nothing here may throw: every entry point is wrapped and fails open.
  */
@@ -13,6 +14,9 @@
 var HEARTBEAT_MS = 30000; // a live run touches its registry entry this often
 var STALE_MS = 5 * 60000; // an entry not touched for this long is dropped even if its pid is alive (pid reuse)
 var BUDGET_FRACTION = 0.8; // default budget: this part of the cores, for all runs together
+var SETTLE_MS = 100; // a run looks at the registry this long after joining it, so runs started together see each other
+var POLL_MS = 500; // a waiting run looks at the registry this often, and touches its entry
+var WAIT_FRESH_MS = 15000; // a "waiting" entry not touched for this long no longer holds its place in the queue
 
 var BIN_RE = /[\\/]\.?bin[\\/](vitest|tsc|vue-tsc)(?:\.[cm]?js)?$/;
 var VITEST_RE = /[\\/]vitest[\\/](?:vitest\.mjs|dist[\\/]cli\.js)$/;
@@ -91,7 +95,8 @@ function readRuns(dir, prune) {
     var pid = +name;
     var file = dir + '/' + name;
     try {
-      var live = isAlive(pid) && (pid === process.pid || now - fs.statSync(file).mtimeMs < STALE_MS);
+      var age = now - fs.statSync(file).mtimeMs;
+      var live = isAlive(pid) && (pid === process.pid || age < STALE_MS);
       if (!live) {
         if (prune) fs.unlinkSync(file);
         continue;
@@ -101,6 +106,9 @@ function readRuns(dir, prune) {
         info = JSON.parse(fs.readFileSync(file, 'utf8'));
       } catch (e) {} // unreadable: count it as a run that has claimed nothing yet
       info.pid = pid;
+      // a run that says it is waiting but has stopped touching its entry (suspended, or its wait failed)
+      // must not hold up the runs behind it
+      if (info.waiting && age > WAIT_FRESH_MS) info.waiting = false;
       runs.push(info);
     } catch (e) {} // vanished between readdir and stat: its run has ended
   }
@@ -119,27 +127,43 @@ function isNum(v) {
 }
 
 /**
- * The workers a run may take, given the other runs that draw on the budget.
- *   share = max(min, min(floor(budget / active runs), budget - workers already claimed))
+ * Where a run stands, given the other runs that draw on the budget.
  * `seq` is this run's place in the start order (Infinity for "a run started now").
- * Claimed are the shares other runs have recorded, plus, for runs that started before this one and have
- * not recorded theirs yet, the share this same rule will give them. Runs that started after this one and
- * are still deciding are not counted: they count this one. That keeps runs started in the same instant
- * from each taking the whole budget.
+ *   claimed: the shares other runs have recorded, plus, for runs that started before this one and have
+ *            not decided yet, the share this same rule will give them. Runs that started after this one
+ *            and are still deciding are not counted: they count this one. That keeps runs started in the
+ *            same instant from each taking the whole budget. Waiting runs claim nothing.
+ *   ahead:   runs that are waiting, or about to wait, and started before this one. First come, first
+ *            served: this run does not start while there are any.
+ *   share:   min(floor(budget / active runs), what is free), and never less than min.
  */
 function claimFor(others, seq, pid, budget, min) {
   var active = others.length + 1;
   var even = Math.floor(budget / active);
   var claimed = 0;
+  var holders = 0;
+  var ahead = 0;
   var pending = [];
   for (var i = 0; i < others.length; i++) {
     var r = others[i];
-    if (isNum(r.share)) claimed += r.share;
-    else if (isNum(r.seq) && (r.seq < seq || (r.seq === seq && r.pid < pid))) pending.push(r);
+    var before = isNum(r.seq) && (r.seq < seq || (r.seq === seq && r.pid < pid));
+    if (r.waiting) {
+      if (before) ahead++;
+    } else if (isNum(r.share)) {
+      claimed += r.share;
+      holders++;
+    } else if (before) pending.push(r);
   }
   pending.sort(function (a, b) { return a.seq - b.seq || a.pid - b.pid; });
-  for (var j = 0; j < pending.length; j++) claimed += Math.max(min, Math.min(even, budget - claimed));
-  return { active: active, claimed: claimed, share: Math.max(min, Math.min(even, budget - claimed)) };
+  for (var j = 0; j < pending.length; j++) {
+    if (ahead || budget - claimed < min) ahead++; // it will wait
+    else {
+      claimed += Math.max(min, Math.min(even, budget - claimed));
+      holders++;
+    }
+  }
+  var free = Math.max(0, budget - claimed);
+  return { active: active, claimed: claimed, holders: holders, ahead: ahead, free: free, share: Math.max(min, Math.min(even, free)) };
 }
 
 /** What `vitest <args>` will do: { skip } for commands that run no tests, else { watch }. */
@@ -226,6 +250,22 @@ function configLimit(args, cores) {
   }
 }
 
+/** Blocks this thread without spinning. */
+function sleep(ms) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+/** One line on stderr, written at once (these are the only lines printed without TEST_SHARE_DEBUG). */
+function say(text) {
+  try {
+    require('fs').writeSync(2, 'test-share: ' + text + '\n');
+  } catch (e) {}
+}
+
+function plural(n, word) {
+  return n + ' ' + word + (n === 1 ? '' : 's');
+}
+
 function lowerPriority(nice) {
   if (nice <= 0) return null;
   try {
@@ -267,6 +307,13 @@ function registerVitest(mode, debug) {
   entry.seq = hr[0] * 1e6 + Math.floor(hr[1] / 1e3);
   writeEntry(fs, dir, entry);
 
+  // Runs started together reach this point some milliseconds apart. Deciding at once would hand the
+  // first ones the whole budget and leave the last one waiting, so each gives the others a moment.
+  if (!mode.watch) {
+    try {
+      sleep(intEnv('TEST_SHARE_SETTLE_MS', SETTLE_MS, 0, 5000));
+    } catch (e) {}
+  }
   var runs = readRuns(dir, true); // always, so every start prunes
   if (mode.watch) {
     // A watch run lives for hours and is idle for most of them: it keeps vitest's watch default (half
@@ -274,30 +321,69 @@ function registerVitest(mode, debug) {
     if (debug) debug.push('budget=' + budget, 'share=default', '(watch: not capped, not counted)');
     return;
   }
+  // A worker count the caller fixed (environment or command line) is kept as it is.
+  var env = process.env;
+  var names = ['VITEST_MAX_THREADS', 'VITEST_MAX_FORKS', 'VITEST_MAX_WORKERS'];
+  var callerMax = null;
+  for (var k = 0; k < names.length; k++) {
+    var v = env[names[k]] ? workerCount(env[names[k]], cores) : null;
+    if (v !== null && (callerMax === null || v > callerMax)) callerMax = v;
+  }
+  var onCli = args.some(function (a) { return EXPLICIT_ARG_RE.test(a); });
+  var fromArgs = onCli ? argWorkers(args, cores) : null;
+  var limit = onCli ? null : configLimit(args, cores);
+  var fixed = onCli ? fromArgs : callerMax;
+  // What must be free before this run starts: its fixed number, else the smallest useful share.
+  var need = Math.min(budget, fixed !== null ? fixed : limit !== null && limit < min ? limit : min);
+
   var claim = claimFor(sharing(runs, process.pid), entry.seq, process.pid, budget, min);
+  var waited = null;
+  var timedOut = false;
+  try {
+    var waitMs = intEnv('TEST_SHARE_WAIT', 60, 0, 86400) * 1000;
+    if (waitMs > 0 && (claim.ahead > 0 || claim.free < need)) {
+      // The budget is used up: wait for a share instead of piling on. Blocking here holds vitest back
+      // before it has started anything. Waiters go in start order; each poll prunes dead entries, so a
+      // run or waiter that was killed frees its place.
+      var t0 = Date.now();
+      entry.waiting = true;
+      writeEntry(fs, dir, entry);
+      say(claim.claimed + ' of ' + budget + ' test workers in use by ' + plural(claim.holders, 'other run') +
+        (claim.ahead ? ', ' + plural(claim.ahead, 'run') + ' waiting ahead' : '') +
+        '; waiting up to ' + waitMs / 1000 + 's for ' + (need > min ? need + ' free workers' : 'a free share') +
+        ' (TEST_SHARE_WAIT=0 to skip)');
+      for (;;) {
+        sleep(POLL_MS);
+        var now = new Date();
+        fs.utimesSync(file, now, now);
+        claim = claimFor(sharing(readRuns(dir, true), process.pid), entry.seq, process.pid, budget, min);
+        waited = Date.now() - t0;
+        if (claim.ahead === 0 && claim.free >= need) break;
+        if (waited >= waitMs) {
+          timedOut = true;
+          break;
+        }
+      }
+    }
+  } catch (e) {
+    if (debug) debug.push('wait-error=' + (e && e.message));
+  }
+  delete entry.waiting;
+
   var share = claim.share;
   var set = [];
   var why = '';
   var taken;
-  if (args.some(function (a) { return EXPLICIT_ARG_RE.test(a); })) {
-    var fromArgs = argWorkers(args, cores);
+  if (onCli) {
     taken = fromArgs === null ? share : fromArgs;
     why = 'worker count given on the command line, left alone';
   } else {
-    var limit = configLimit(args, cores);
     if (limit !== null && limit < share) {
       share = limit;
       why = 'kept to the limit in the project config';
     }
     // vitest 3.x reads VITEST_MAX_THREADS / VITEST_MAX_FORKS, 4.x and later read VITEST_MAX_WORKERS.
     // A value the caller already set always wins, and is what this run claims from the budget.
-    var env = process.env;
-    var names = ['VITEST_MAX_THREADS', 'VITEST_MAX_FORKS', 'VITEST_MAX_WORKERS'];
-    var callerMax = null;
-    for (var k = 0; k < names.length; k++) {
-      var v = env[names[k]] ? workerCount(env[names[k]], cores) : null;
-      if (v !== null && (callerMax === null || v > callerMax)) callerMax = v;
-    }
     taken = callerMax === null ? share : callerMax;
     var fill = Math.min(share, taken); // for the variables the caller left unset
     for (var i = 0; i < 2; i++) {
@@ -328,6 +414,10 @@ function registerVitest(mode, debug) {
   try {
     writeEntry(fs, dir, entry);
   } catch (e) {}
+  if (waited !== null) {
+    say('waited ' + Math.round(waited / 1000) + 's' + (timedOut ? ', budget still in use' : '') +
+      '; starting with ' + plural(taken, 'test worker'));
+  }
   if (debug) {
     debug.push('budget=' + budget, 'active=' + claim.active, 'claimed=' + claim.claimed, 'share=' + taken);
     if (set.length) debug.push('set=' + set.join(','));
@@ -347,6 +437,9 @@ function main(kind) {
     }
   } catch (e) {
     if (debug) debug.push('error=' + (e && e.message));
+    try {
+      require('fs').unlinkSync(registryDir() + '/' + process.pid); // never leave a half-made entry in the queue
+    } catch (e2) {}
   }
   var nice = lowerPriority(intEnv('TEST_SHARE_NICE', 10, 0, 19));
   if (debug) {
