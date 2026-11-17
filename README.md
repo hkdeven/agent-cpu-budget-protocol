@@ -1,6 +1,8 @@
-# test-share
+# test-cpu-budget
 
-Stops parallel `vitest` and `tsc` runs from oversubscribing this Mac, without a fixed worker cap and without touching any project.
+Keeps test runs inside a CPU budget. When several Claude agents run `vitest` and `tsc` at once on this Mac, it shares a fixed number of test workers between them, makes late runs wait for a free share, and runs them at low priority, so the machine is used but never overloaded. No project is touched.
+
+Formerly called test-share: the settings keep the `TEST_SHARE_` prefix and the registry stays in `~/.cache/test-share`.
 
 One file, `preload.cjs`, is loaded into every node process through `NODE_OPTIONS`. It does two things:
 
@@ -15,10 +17,10 @@ Every other node process (npm, vite, vitest's own workers, scripts) leaves after
 Add to the `env` block of `~/.claude/settings.json`:
 
 ```json
-"NODE_OPTIONS": "--require /Users/casandra/Code/Personal/test-share/preload.cjs"
+"NODE_OPTIONS": "--require /Users/casandra/Code/Personal/test-cpu-budget/preload.cjs"
 ```
 
-For one shell: `export NODE_OPTIONS="--require /Users/casandra/Code/Personal/test-share/preload.cjs"`.
+For one shell: `export NODE_OPTIONS="--require /Users/casandra/Code/Personal/test-cpu-budget/preload.cjs"`.
 
 ## Switch off
 
@@ -61,8 +63,8 @@ The preload sets `VITEST_MAX_THREADS`, `VITEST_MAX_FORKS` (read by vitest 3.x, t
 - **Bound.** After `TEST_SHARE_WAIT` seconds (default 60) it stops waiting and starts with `TEST_SHARE_MIN` workers, so the total can then pass the budget by that much for each run that timed out. The bound is there because agents run tests inside tool calls with their own timeouts.
 - **Explicit numbers.** A run whose worker count the caller fixed (`VITEST_MAX_*` or `--maxWorkers`) waits the same way until that many workers are free (at most the whole budget), then starts with its own number. After the timeout it starts with its own number anyway.
 - **Not silent.** Two stderr lines, printed without `TEST_SHARE_DEBUG`:
-  `test-share: 12 of 12 test workers in use by 1 other run; waiting up to 60s for a free share (TEST_SHARE_WAIT=0 to skip)`
-  `test-share: waited 9s; starting with 4 test workers`
+  `test-cpu-budget: 12 of 12 test workers in use by 1 other run; waiting up to 60s for a free share (TEST_SHARE_WAIT=0 to skip)`
+  `test-cpu-budget: waited 9s; starting with 4 test workers`
 - **Killed runs.** A holder or waiter that dies frees its place at the next check (within half a second). Ctrl-C or SIGTERM during the wait ends the run at once.
 - **Started together.** Every run pauses 100 ms after joining the registry before it decides, so runs started in the same instant see each other and split the budget evenly instead of the last one waiting.
 

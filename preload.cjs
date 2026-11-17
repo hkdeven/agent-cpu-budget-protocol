@@ -1,7 +1,7 @@
 'use strict';
 /*
- * test-share preload. Loaded into every node process with
- *   NODE_OPTIONS=--require /Users/casandra/Code/Personal/test-share/preload.cjs
+ * test-cpu-budget preload. Loaded into every node process with
+ *   NODE_OPTIONS=--require /Users/casandra/Code/Personal/test-cpu-budget/preload.cjs
  *
  * Non-targets leave through the few lines at the bottom of this file: no requires, no I/O.
  * Targets:
@@ -258,7 +258,7 @@ function sleep(ms) {
 /** One line on stderr, written at once (these are the only lines printed without TEST_SHARE_DEBUG). */
 function say(text) {
   try {
-    require('fs').writeSync(2, 'test-share: ' + text + '\n');
+    require('fs').writeSync(2, 'test-cpu-budget: ' + text + '\n');
   } catch (e) {}
 }
 
@@ -428,7 +428,7 @@ function registerVitest(mode, debug) {
 function main(kind) {
   // Worker threads run the preload too, with the main thread's argv: only the main thread is a target.
   if (!require('worker_threads').isMainThread) return;
-  var debug = process.env.TEST_SHARE_DEBUG === '1' ? ['[test-share] pid=' + process.pid, kind] : null;
+  var debug = process.env.TEST_SHARE_DEBUG === '1' ? ['[test-cpu-budget] pid=' + process.pid, kind] : null;
   try {
     if (kind === 'vitest') {
       var mode = vitestMode(process.argv.slice(2));

@@ -11,9 +11,9 @@ const min = ts.intEnv('TEST_SHARE_MIN', 2, 1, budget);
 const runs = ts.readRuns(dir, false).sort((a, b) => (a.started || 0) - (b.started || 0));
 const sharing = ts.sharing(runs, -1);
 const claimed = sharing.reduce((sum, r) => sum + (typeof r.share === 'number' ? r.share : 0), 0);
-const on = /test-share[\\/]preload\.cjs/.test(process.env.NODE_OPTIONS || '') && process.env.TEST_SHARE !== '0';
+const on = /test-(share|cpu-budget)[\\/]preload\.cjs/.test(process.env.NODE_OPTIONS || '') && process.env.TEST_SHARE !== '0';
 
-console.log(`test-share: ${on ? 'on' : 'off'} in this shell, ${cores} cores, min ${min}, registry ${dir}`);
+console.log(`test-cpu-budget: ${on ? 'on' : 'off'} in this shell, ${cores} cores, min ${min}, registry ${dir}`);
 console.log(`budget ${budget} workers, claimed ${claimed}, free ${Math.max(0, budget - claimed)}, waiting ${sharing.filter((r) => r.waiting).length}${claimed > budget ? `, over by ${claimed - budget}` : ''}`);
 if (!runs.length) console.log('no active runs');
 const queue = sharing.filter((r) => r.waiting).sort((a, b) => (a.seq || 0) - (b.seq || 0) || a.pid - b.pid);
